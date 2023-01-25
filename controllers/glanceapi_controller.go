@@ -229,7 +229,6 @@ func (r *GlanceAPIReconciler) reconcileInit(
 	// expose the service (create service, route and return the created endpoint URLs)
 	//
 	ports := map[endpoint.Endpoint]endpoint.Data{}
-
 	if instance.Spec.APIType == glancev1.APIInternal {
 		ports[endpoint.EndpointAdmin] = endpoint.Data{
 			Port: glance.GlanceAdminPort,
@@ -241,6 +240,17 @@ func (r *GlanceAPIReconciler) reconcileInit(
 		ports[endpoint.EndpointPublic] = endpoint.Data{
 			Port: glance.GlancePublicPort,
 		}
+	}
+
+	for _, metallbcfg := range instance.Spec.ExternalEndpoints {
+		portCfg := ports[metallbcfg.Endpoint]
+		portCfg.MetalLB = &endpoint.MetalLBData{
+			IPAddressPool:   metallbcfg.IPAddressPool,
+			SharedIP:        metallbcfg.SharedIP,
+			LoadBalancerIPs: metallbcfg.LoadBalancerIPs,
+		}
+
+		ports[metallbcfg.Endpoint] = portCfg
 	}
 
 	apiEndpoints, ctrlResult, err := endpoint.ExposeEndpoints(

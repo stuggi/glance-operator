@@ -837,11 +837,6 @@ spec:
                 properties:
                   service:
                     properties:
-                      endpoint:
-                        enum:
-                        - internal
-                        - public
-                        type: string
                       endpointURL:
                         type: string
                       metadata:
@@ -885,8 +880,6 @@ spec:
                           type:
                             type: string
                         type: object
-                    required:
-                    - endpoint
                     type: object
                 type: object
               passwordSelectors:

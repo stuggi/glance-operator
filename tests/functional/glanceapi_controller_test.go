@@ -287,8 +287,8 @@ var _ = Describe("Glanceapi controller", func() {
 		})
 
 		It("creates LoadBalancer service", func() {
-			// As the internal endpoint is configured in ExternalEndpoints it
-			// gets a LoadBalancer Service with MetalLB annotations
+			// As the internal endpoint is configured in service overrides it
+			// gets a LoadBalancer Service with annotations
 			service := th.GetService(glanceTest.GlanceInternalRoute)
 			Expect(service.Annotations).To(
 				HaveKeyWithValue("dnsmasq.network.openstack.org/hostname", "glance-internal.openstack.svc"))

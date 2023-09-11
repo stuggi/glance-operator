@@ -100,7 +100,7 @@ type GlanceAPITemplate struct {
 // APIOverrideSpec to override the generated manifest of several child resources.
 type APIOverrideSpec struct {
 	// Override configuration for the Service created to serve traffic to the cluster.
-	Service *service.OverrideSpec `json:"service,omitempty"`
+	Service *service.RoutedOverrideSpec `json:"service,omitempty"`
 }
 
 // SetupDefaults - initializes any CRD field defaults based on environment variables (the defaulting mechanism itself is implemented via webhooks)

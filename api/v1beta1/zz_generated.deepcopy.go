@@ -33,7 +33,7 @@ func (in *APIOverrideSpec) DeepCopyInto(out *APIOverrideSpec) {
 	*out = *in
 	if in.Service != nil {
 		in, out := &in.Service, &out.Service
-		*out = new(service.OverrideSpec)
+		*out = new(service.RoutedOverrideSpec)
 		(*in).DeepCopyInto(*out)
 	}
 }

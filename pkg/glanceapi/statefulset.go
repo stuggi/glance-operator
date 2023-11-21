@@ -23,6 +23,8 @@ import (
 	common "github.com/openstack-k8s-operators/lib-common/modules/common"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/affinity"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/env"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -88,9 +90,11 @@ func StatefulSet(
 		//
 
 		port := int32(glance.GlancePublicPort)
+		tlsEnabled := instance.Spec.TLS.API.Enabled(service.EndpointPublic)
 
 		if instance.Spec.APIType == glancev1.APIInternal {
 			port = int32(glance.GlanceInternalPort)
+			tlsEnabled = instance.Spec.TLS.API.Enabled(service.EndpointInternal)
 		}
 
 		livenessProbe.HTTPGet = &corev1.HTTPGetAction{
@@ -100,6 +104,11 @@ func StatefulSet(
 		readinessProbe.HTTPGet = &corev1.HTTPGetAction{
 			Path: "/healthcheck",
 			Port: intstr.IntOrString{Type: intstr.Int, IntVal: port},
+		}
+
+		if tlsEnabled {
+			livenessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+			readinessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
 		}
 		startupProbe.Exec = &corev1.ExecAction{
 			Command: []string{
@@ -143,6 +152,34 @@ func StatefulSet(
 	if len(instance.Spec.ImageCacheSize) > 0 {
 		apiVolumes = append(apiVolumes, glance.GetCacheVolume(glance.ServiceName+"-cache")...)
 		apiVolumeMounts = append(apiVolumeMounts, glance.GetCacheVolumeMount()...)
+	}
+
+	httpdVolumeMount := glance.GetHttpdVolumeMount()
+
+	// Add the CA bundle to the apiVolumes and httpdVolumeMount
+	if instance.Spec.TLS.CaBundleSecretName != "" {
+		apiVolumes = append(apiVolumes, instance.Spec.TLS.CreateVolume())
+		apiVolumeMounts = append(apiVolumeMounts, instance.Spec.TLS.CreateVolumeMounts(nil)...)
+		httpdVolumeMount = append(httpdVolumeMount, instance.Spec.TLS.CreateVolumeMounts(nil)...)
+	}
+
+	for endpt := range GetGlanceEndpoints(instance.Spec.APIType) {
+		if instance.Spec.TLS.API.Enabled(endpt) {
+			var tlsEndptCfg tls.GenericService
+			switch endpt {
+			case service.EndpointPublic:
+				tlsEndptCfg = instance.Spec.TLS.API.Public
+			case service.EndpointInternal:
+				tlsEndptCfg = instance.Spec.TLS.API.Internal
+			}
+
+			svc, err := tlsEndptCfg.ToService()
+			if err != nil {
+				return nil, err
+			}
+			apiVolumes = append(apiVolumes, svc.CreateVolume(endpt.String()))
+			httpdVolumeMount = append(httpdVolumeMount, svc.CreateVolumeMounts(endpt.String())...)
+		}
 	}
 
 	// Do not append apiType if we only have a single glanceAPI instance
@@ -209,7 +246,7 @@ func StatefulSet(
 								RunAsUser: &runAsUser,
 							},
 							Env:            env.MergeEnvs([]corev1.EnvVar{}, envVars),
-							VolumeMounts:   glance.GetHttpdVolumeMount(),
+							VolumeMounts:   httpdVolumeMount,
 							Resources:      instance.Spec.Resources,
 							StartupProbe:   startupProbe,
 							ReadinessProbe: readinessProbe,

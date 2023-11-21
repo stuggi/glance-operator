@@ -26,6 +26,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	openstack "github.com/openstack-k8s-operators/lib-common/modules/openstack"
 	corev1 "k8s.io/api/core/v1"
@@ -100,6 +101,11 @@ type GlanceAPITemplate struct {
 	// +kubebuilder:validation:Enum=split;single
 	// +kubebuilder:default:=split
 	Type string `json:"type,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// TLS - Parameters related to the TLS
+	TLS tls.API `json:"tls,omitempty"`
 }
 
 // APIOverrideSpec to override the generated manifest of several child resources.

@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -35,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	certmgrv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/go-logr/logr"
 	networkv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	cinderv1 "github.com/openstack-k8s-operators/cinder-operator/api/v1beta1"
@@ -42,6 +44,7 @@ import (
 	"github.com/openstack-k8s-operators/glance-operator/pkg/glance"
 	"github.com/openstack-k8s-operators/glance-operator/pkg/glanceapi"
 	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
+	"github.com/openstack-k8s-operators/lib-common/modules/certmanager"
 	"github.com/openstack-k8s-operators/lib-common/modules/common"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/endpoint"
@@ -53,6 +56,7 @@ import (
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/statefulset"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -80,6 +84,8 @@ type GlanceAPIReconciler struct {
 // +kubebuilder:rbac:groups=keystone.openstack.org,resources=keystoneapis,verbs=get;list;watch;
 // +kubebuilder:rbac:groups=keystone.openstack.org,resources=keystoneendpoints,verbs=get;list;watch;create;update;patch;delete;
 // +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=issuers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete;
 
 // Reconcile reconcile Glance API requests
 func (r *GlanceAPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
@@ -247,6 +253,7 @@ func (r *GlanceAPIReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&certmgrv1.Certificate{}).
 		Watches(&source.Kind{Type: &corev1.Secret{}},
 			handler.EnqueueRequestsFromMapFunc(svcSecretFn)).
 		Watches(&source.Kind{Type: &networkv1.NetworkAttachmentDefinition{}},
@@ -285,30 +292,14 @@ func (r *GlanceAPIReconciler) reconcileInit(
 	instance *glancev1.GlanceAPI,
 	helper *helper.Helper,
 	serviceLabels map[string]string,
-) (ctrl.Result, error) {
+) (map[service.Endpoint]tls.Service, ctrl.Result, error) {
 	r.Log.Info(fmt.Sprintf("Reconciling Service '%s' init", instance.Name))
+	tlsEndptCfgMap := make(map[service.Endpoint]tls.Service)
 
 	//
 	// create service/s
 	//
-	glanceEndpoints := map[service.Endpoint]endpoint.Data{}
-	// split
-	if instance.Spec.APIType == glancev1.APIInternal {
-		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
-			Port: glance.GlanceInternalPort,
-		}
-	} else {
-		glanceEndpoints[service.EndpointPublic] = endpoint.Data{
-			Port: glance.GlancePublicPort,
-		}
-	}
-	// if we're not splitting the API and deploying a single instance, we have
-	// to add both internal and public endpoints
-	if instance.Spec.APIType == glancev1.APISingle {
-		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
-			Port: glance.GlanceInternalPort,
-		}
-	}
+	glanceEndpoints := getGlanceEndpoints(instance.Spec.APIType)
 	apiEndpoints := make(map[string]string)
 
 	for endpointType, data := range glanceEndpoints {
@@ -350,7 +341,7 @@ func (r *GlanceAPIReconciler) reconcileInit(
 				condition.ExposeServiceReadyErrorMessage,
 				err.Error()))
 
-			return ctrl.Result{}, err
+			return tlsEndptCfgMap, ctrl.Result{}, err
 		}
 
 		svc.AddAnnotation(map[string]string{
@@ -382,22 +373,61 @@ func (r *GlanceAPIReconciler) reconcileInit(
 				condition.ExposeServiceReadyErrorMessage,
 				err.Error()))
 
-			return ctrlResult, err
+			return tlsEndptCfgMap, ctrlResult, err
 		} else if (ctrlResult != ctrl.Result{}) {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ExposeServiceReadyCondition,
 				condition.RequestedReason,
 				condition.SeverityInfo,
 				condition.ExposeServiceReadyRunningMessage))
-			return ctrlResult, nil
+			return tlsEndptCfgMap, ctrlResult, nil
 		}
 		// create service - end
 
-		// TODO: TLS, pass in https as protocol, create TLS cert
+		// create TLS certificates if enabled
+		if endpointTLSCfg, ok := instance.Spec.TLS.API.Endpoint[endpointType]; ok && instance.Spec.TLS.API.Enabled() {
+			// generate certificate
+			if endpointTLSCfg.SecretName == nil && endpointTLSCfg.IssuerName != nil {
+				// request certificate
+				certRequest := certmanager.CertificateRequest{
+					IssuerName:  *endpointTLSCfg.IssuerName,
+					CertName:    fmt.Sprintf("%s-svc", endpointName),
+					Duration:    nil,
+					Hostnames:   []string{svc.GetServiceHostname()},
+					Ips:         nil,
+					Annotations: map[string]string{},
+					Labels:      exportLabels,
+					Usages:      nil,
+				}
+				certSecret, ctrlResult, err := certmanager.EnsureCert(
+					ctx,
+					helper,
+					certRequest)
+				if err != nil {
+					return tlsEndptCfgMap, ctrlResult, err
+				} else if (ctrlResult != ctrl.Result{}) {
+					return tlsEndptCfgMap, ctrlResult, nil
+				}
+
+				endpointTLSCfg.SecretName = ptr.To(certSecret.Name)
+			}
+
+			// convert to tls.Service. Here we could also set different
+			// mount points for the certificates if required
+			tlsService, err := endpointTLSCfg.ToService()
+			if err != nil {
+				return tlsEndptCfgMap, ctrlResult, err
+			}
+
+			tlsEndptCfgMap[endpointType] = *tlsService
+
+			// set endpoint protocol to https
+			data.Protocol = ptr.To(service.ProtocolHTTPS)
+		}
 		apiEndpoints[string(endpointType)], err = svc.GetAPIEndpoint(
 			svcOverride.EndpointURL, data.Protocol, data.Path)
 		if err != nil {
-			return ctrl.Result{}, err
+			return tlsEndptCfgMap, ctrl.Result{}, err
 		}
 	}
 	instance.Status.Conditions.MarkTrue(condition.ExposeServiceReadyCondition, condition.ExposeServiceReadyMessage)
@@ -424,7 +454,7 @@ func (r *GlanceAPIReconciler) reconcileInit(
 	ksSvc := keystonev1.NewKeystoneEndpoint(instance.Name, instance.Namespace, ksEndpointSpec, serviceLabels, time.Duration(10)*time.Second)
 	ctrlResult, err := ksSvc.CreateOrPatch(ctx, helper)
 	if err != nil {
-		return ctrlResult, err
+		return tlsEndptCfgMap, ctrlResult, err
 	}
 
 	// mirror the Status, Reason, Severity and Message of the latest keystoneendpoint condition
@@ -435,7 +465,7 @@ func (r *GlanceAPIReconciler) reconcileInit(
 	}
 
 	if (ctrlResult != ctrl.Result{}) {
-		return ctrlResult, nil
+		return tlsEndptCfgMap, ctrlResult, nil
 	}
 
 	//
@@ -443,7 +473,7 @@ func (r *GlanceAPIReconciler) reconcileInit(
 	//
 
 	r.Log.Info(fmt.Sprintf("Reconciled Service '%s' init successfully", instance.Name))
-	return ctrl.Result{}, nil
+	return tlsEndptCfgMap, ctrl.Result{}, nil
 }
 
 func (r *GlanceAPIReconciler) reconcileUpdate(ctx context.Context, instance *glancev1.GlanceAPI, helper *helper.Helper) (ctrl.Result, error) {
@@ -513,23 +543,31 @@ func (r *GlanceAPIReconciler) reconcileNormal(ctx context.Context, instance *gla
 	}
 
 	//
-	// create hash over all the different input resources to identify if any those changed
-	// and a restart/recreate is required.
+	// TLS input validation
 	//
-	inputHash, hashChanged, err := r.createHashOfInputHashes(ctx, instance, configVars)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.ServiceConfigReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			condition.ServiceConfigReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, err
-	} else if hashChanged {
-		// Hash changed and instance status should be updated (which will be done by main defer func),
-		// so we need to return and reconcile again
-		return ctrl.Result{}, nil
+	if instance.Spec.TLS.API.Enabled() {
+		// Validate the CA cert secret if provided
+		if instance.Spec.TLS.CaBundleSecretName != "" {
+			hash, ctrlResult, err := tls.ValidateCACertSecret(
+				ctx,
+				helper.GetClient(),
+				types.NamespacedName{
+					Name:      instance.Spec.TLS.CaBundleSecretName,
+					Namespace: instance.Namespace,
+				},
+			)
+			if err != nil {
+				return ctrlResult, err
+			} else if (ctrlResult != ctrl.Result{}) {
+				return ctrlResult, nil
+			}
+
+			if hash != "" {
+				configVars[tls.CABundleKey] = env.SetValue(hash)
+			}
+		}
 	}
+
 	instance.Status.Conditions.MarkTrue(condition.ServiceConfigReadyCondition, condition.ServiceConfigReadyMessage)
 	// Create Secrets - end
 
@@ -560,7 +598,8 @@ func (r *GlanceAPIReconciler) reconcileNormal(ctx context.Context, instance *gla
 	}
 
 	serviceLabels := map[string]string{
-		common.AppSelector: fmt.Sprintf("%s-%s", glance.ServiceName, instance.Spec.APIType),
+		common.AppSelector:   fmt.Sprintf("%s-%s", glance.ServiceName, instance.Spec.APIType),
+		common.OwnerSelector: instance.Name,
 	}
 
 	// networks to attach to
@@ -593,11 +632,25 @@ func (r *GlanceAPIReconciler) reconcileNormal(ctx context.Context, instance *gla
 	}
 
 	// Handle service init
-	ctrlResult, err := r.reconcileInit(ctx, instance, helper, serviceLabels)
+	tlsEndpointConfig, ctrlResult, err := r.reconcileInit(ctx, instance, helper, serviceLabels)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
 		return ctrlResult, nil
+	}
+
+	if len(tlsEndpointConfig) > 0 {
+		certsHash, ctrlResult, err := tls.ValidateEndpointCerts(
+			ctx,
+			helper,
+			instance.Namespace,
+			tlsEndpointConfig)
+		if err != nil {
+			return ctrlResult, err
+		} else if (ctrlResult != ctrl.Result{}) {
+			return ctrlResult, nil
+		}
+		configVars[tls.TLSHashName] = env.SetValue(certsHash)
 	}
 
 	// Handle service update
@@ -620,8 +673,27 @@ func (r *GlanceAPIReconciler) reconcileNormal(ctx context.Context, instance *gla
 	// normal reconcile tasks
 	//
 
+	//
+	// create hash over all the different input resources to identify if any those changed
+	// and a restart/recreate is required.
+	//
+	inputHash, hashChanged, err := r.createHashOfInputHashes(ctx, instance, configVars)
+	if err != nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.ServiceConfigReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.ServiceConfigReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	} else if hashChanged {
+		// Hash changed and instance status should be updated (which will be done by main defer func),
+		// so we need to return and reconcile again
+		return ctrl.Result{}, nil
+	}
+
 	// Define a new StatefuleSet object
-	deplDef, err := glanceapi.StatefulSet(instance, inputHash, serviceLabels, serviceAnnotations, privileged)
+	deplDef, err := glanceapi.StatefulSet(instance, inputHash, serviceLabels, serviceAnnotations, privileged, tlsEndpointConfig)
 	if err != nil {
 		return ctrlResult, err
 	}
@@ -733,6 +805,20 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 		return err
 	}
 
+	glanceEndpoints := getGlanceEndpoints(instance.Spec.APIType)
+	httpdVhostConfig := map[string]interface{}{}
+	for endpt := range glanceEndpoints {
+		endptConfig := map[string]interface{}{}
+		endptConfig["ServerName"] = fmt.Sprintf("glance-%s.%s.svc", endpt.String(), instance.Namespace)
+		endptConfig["TLS"] = false // default TLS to false, and set it bellow to true if enabled
+		if instance.Spec.TLS.API.Enabled() {
+			endptConfig["TLS"] = true
+			endptConfig["SSLCertificateFile"] = fmt.Sprintf("/etc/pki/tls/certs/%s.crt", endpt.String())
+			endptConfig["SSLCertificateKeyFile"] = fmt.Sprintf("/etc/pki/tls/private/%s.key", endpt.String())
+		}
+		httpdVhostConfig[endpt.String()] = endptConfig
+	}
+
 	templateParameters := map[string]interface{}{
 		"ServiceUser":         instance.Spec.ServiceUser,
 		"ServicePassword":     string(ospSecret.Data[instance.Spec.PasswordSelectors.Service]),
@@ -749,6 +835,7 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 		// https://docs.openstack.org/glance/latest/admin/quotas.html
 		"QuotaEnabled": instance.Spec.Quota,
 		"LogFile":      fmt.Sprintf("%s%s.log", glance.GlanceLogPath, instance.Name),
+		"VHosts":       httpdVhostConfig,
 	}
 
 	// Configure the internal GlanceAPI to provide image location data, and the
@@ -801,4 +888,29 @@ func (r *GlanceAPIReconciler) createHashOfInputHashes(
 		r.Log.Info(fmt.Sprintf("Input maps hash %s - %s", common.InputHashName, hash))
 	}
 	return hash, changed, nil
+}
+
+// getGlanceEndpoints - returns the glance endpoints map based on the apiType of the glance-api
+// default is split, in case of single both internal and public endpoint get returned
+func getGlanceEndpoints(apiType string) map[service.Endpoint]endpoint.Data {
+	glanceEndpoints := map[service.Endpoint]endpoint.Data{}
+	// split
+	if apiType == glancev1.APIInternal {
+		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
+			Port: glance.GlanceInternalPort,
+		}
+	} else {
+		glanceEndpoints[service.EndpointPublic] = endpoint.Data{
+			Port: glance.GlancePublicPort,
+		}
+	}
+	// if we're not splitting the API and deploying a single instance, we have
+	// to add both internal and public endpoints
+	if apiType == glancev1.APISingle {
+		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
+			Port: glance.GlanceInternalPort,
+		}
+	}
+
+	return glanceEndpoints
 }

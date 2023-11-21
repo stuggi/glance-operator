@@ -718,6 +718,8 @@ func (r *GlanceReconciler) apiDeploymentCreateOrUpdate(
 		Quota:             instance.IsQuotaEnabled(),
 		ImageCacheSize:    instance.Spec.ImageCacheSize,
 	}
+	instance.Spec.TLS.API.DeepCopyInto(&apiSpec.TLS.API)
+	instance.Spec.TLS.Ca.DeepCopyInto(&apiSpec.TLS.Ca)
 
 	if apiSpec.GlanceAPITemplate.NodeSelector == nil {
 		apiSpec.GlanceAPITemplate.NodeSelector = instance.Spec.NodeSelector

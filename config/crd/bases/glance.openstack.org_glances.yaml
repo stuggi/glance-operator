@@ -993,6 +993,28 @@ spec:
                 type: string
               storageRequest:
                 type: string
+              tls:
+                properties:
+                  api:
+                    properties:
+                      disabled:
+                        type: boolean
+                      endpoint:
+                        additionalProperties:
+                          properties:
+                            secretName:
+                              type: string
+                          type: object
+                        type: object
+                    type: object
+                  caBundleSecretName:
+                    type: string
+                  db:
+                    properties:
+                      disabled:
+                        type: boolean
+                    type: object
+                type: object
             required:
             - containerImage
             - databaseInstance

@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -53,6 +54,7 @@ import (
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/statefulset"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -291,24 +293,7 @@ func (r *GlanceAPIReconciler) reconcileInit(
 	//
 	// create service/s
 	//
-	glanceEndpoints := map[service.Endpoint]endpoint.Data{}
-	// split
-	if instance.Spec.APIType == glancev1.APIInternal {
-		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
-			Port: glance.GlanceInternalPort,
-		}
-	} else {
-		glanceEndpoints[service.EndpointPublic] = endpoint.Data{
-			Port: glance.GlancePublicPort,
-		}
-	}
-	// if we're not splitting the API and deploying a single instance, we have
-	// to add both internal and public endpoints
-	if instance.Spec.APIType == glancev1.APISingle {
-		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
-			Port: glance.GlanceInternalPort,
-		}
-	}
+	glanceEndpoints := getGlanceEndpoints(instance.Spec.APIType)
 	apiEndpoints := make(map[string]string)
 
 	for endpointType, data := range glanceEndpoints {
@@ -393,7 +378,11 @@ func (r *GlanceAPIReconciler) reconcileInit(
 		}
 		// create service - end
 
-		// TODO: TLS, pass in https as protocol, create TLS cert
+		// create TLS certificates if enabled
+		if _, ok := instance.Spec.TLS.API.Endpoint[endpointType]; ok && instance.Spec.TLS.API.Enabled() {
+			// set endpoint protocol to https
+			data.Protocol = ptr.To(service.ProtocolHTTPS)
+		}
 		apiEndpoints[string(endpointType)], err = svc.GetAPIEndpoint(
 			svcOverride.EndpointURL, data.Protocol, data.Path)
 		if err != nil {
@@ -513,6 +502,48 @@ func (r *GlanceAPIReconciler) reconcileNormal(ctx context.Context, instance *gla
 	}
 
 	//
+	// TLS input validation
+	//
+	if instance.Spec.TLS.API.Enabled() {
+		// Validate the CA cert secret if provided
+		if instance.Spec.TLS.CaBundleSecretName != "" {
+			hash, ctrlResult, err := tls.ValidateCACertSecret(
+				ctx,
+				helper.GetClient(),
+				types.NamespacedName{
+					Name:      instance.Spec.TLS.CaBundleSecretName,
+					Namespace: instance.Namespace,
+				},
+			)
+			if err != nil {
+				return ctrlResult, err
+			} else if (ctrlResult != ctrl.Result{}) {
+				return ctrlResult, nil
+			}
+
+			if hash != "" {
+				configVars[tls.CABundleKey] = env.SetValue(hash)
+			}
+		}
+
+		// TODO validate cert secrets
+		/*
+			certsHash, ctrlResult, err := tls.ValidateEndpointCerts(
+				ctx,
+				helper,
+				instance.Namespace,
+				tlsEndpointConfig)
+			if err != nil {
+				return ctrlResult, err
+			} else if (ctrlResult != ctrl.Result{}) {
+				return ctrlResult, nil
+			}
+			configVars[tls.TLSHashName] = env.SetValue(certsHash)
+		*/
+
+	}
+
+	//
 	// create hash over all the different input resources to identify if any those changed
 	// and a restart/recreate is required.
 	//
@@ -560,7 +591,8 @@ func (r *GlanceAPIReconciler) reconcileNormal(ctx context.Context, instance *gla
 	}
 
 	serviceLabels := map[string]string{
-		common.AppSelector: fmt.Sprintf("%s-%s", glance.ServiceName, instance.Spec.APIType),
+		common.AppSelector:   fmt.Sprintf("%s-%s", glance.ServiceName, instance.Spec.APIType),
+		common.OwnerSelector: instance.Name,
 	}
 
 	// networks to attach to
@@ -730,6 +762,20 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 		return err
 	}
 
+	glanceEndpoints := getGlanceEndpoints(instance.Spec.APIType)
+	httpdVhostConfig := map[string]interface{}{}
+	for endpt := range glanceEndpoints {
+		endptConfig := map[string]interface{}{}
+		endptConfig["ServerName"] = fmt.Sprintf("glance-%s.%s.svc", endpt.String(), instance.Namespace)
+		endptConfig["TLS"] = false // default TLS to false, and set it bellow to true if enabled
+		if instance.Spec.TLS.API.Enabled() {
+			endptConfig["TLS"] = true
+			endptConfig["SSLCertificateFile"] = fmt.Sprintf("/etc/pki/tls/certs/%s.crt", endpt.String())
+			endptConfig["SSLCertificateKeyFile"] = fmt.Sprintf("/etc/pki/tls/private/%s.key", endpt.String())
+		}
+		httpdVhostConfig[endpt.String()] = endptConfig
+	}
+
 	templateParameters := map[string]interface{}{
 		"ServiceUser":         instance.Spec.ServiceUser,
 		"ServicePassword":     string(ospSecret.Data[instance.Spec.PasswordSelectors.Service]),
@@ -746,6 +792,7 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 		// https://docs.openstack.org/glance/latest/admin/quotas.html
 		"QuotaEnabled": instance.Spec.Quota,
 		"LogFile":      fmt.Sprintf("%s%s.log", glance.GlanceLogPath, instance.Name),
+		"VHosts":       httpdVhostConfig,
 	}
 
 	// Configure the internal GlanceAPI to provide image location data, and the
@@ -798,4 +845,29 @@ func (r *GlanceAPIReconciler) createHashOfInputHashes(
 		r.Log.Info(fmt.Sprintf("Input maps hash %s - %s", common.InputHashName, hash))
 	}
 	return hash, changed, nil
+}
+
+// getGlanceEndpoints - returns the glance endpoints map based on the apiType of the glance-api
+// default is split, in case of single both internal and public endpoint get returned
+func getGlanceEndpoints(apiType string) map[service.Endpoint]endpoint.Data {
+	glanceEndpoints := map[service.Endpoint]endpoint.Data{}
+	// split
+	if apiType == glancev1.APIInternal {
+		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
+			Port: glance.GlanceInternalPort,
+		}
+	} else {
+		glanceEndpoints[service.EndpointPublic] = endpoint.Data{
+			Port: glance.GlancePublicPort,
+		}
+	}
+	// if we're not splitting the API and deploying a single instance, we have
+	// to add both internal and public endpoints
+	if apiType == glancev1.APISingle {
+		glanceEndpoints[service.EndpointInternal] = endpoint.Data{
+			Port: glance.GlanceInternalPort,
+		}
+	}
+
+	return glanceEndpoints
 }

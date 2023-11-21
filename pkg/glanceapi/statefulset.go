@@ -101,6 +101,10 @@ func StatefulSet(
 			Path: "/healthcheck",
 			Port: intstr.IntOrString{Type: intstr.Int, IntVal: port},
 		}
+		if instance.Spec.TLS.API.Enabled() {
+			livenessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+			readinessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+		}
 		startupProbe.Exec = &corev1.ExecAction{
 			Command: []string{
 				"/bin/true",
@@ -143,6 +147,28 @@ func StatefulSet(
 	if len(instance.Spec.ImageCacheSize) > 0 {
 		apiVolumes = append(apiVolumes, glance.GetCacheVolume(glance.ServiceName+"-cache")...)
 		apiVolumeMounts = append(apiVolumeMounts, glance.GetCacheVolumeMount()...)
+	}
+
+	httpdVolumeMount := glance.GetHttpdVolumeMount()
+
+	// Add the CA bundle to the apiVolumes and httpdVolumeMount
+	if instance.Spec.TLS.CaBundleSecretName != "" {
+		apiVolumes = append(apiVolumes, instance.Spec.TLS.CreateVolume())
+		apiVolumeMounts = append(apiVolumeMounts, instance.Spec.TLS.CreateVolumeMounts(nil)...)
+		httpdVolumeMount = append(httpdVolumeMount, instance.Spec.TLS.CreateVolumeMounts(nil)...)
+	}
+
+	// add TLS certificates if enabled
+	if instance.Spec.TLS.API.Enabled() {
+		// add service cert Volume to httpdVolumeMount
+		for endpt, tlsEndptCfg := range instance.Spec.TLS.API.Endpoint {
+			svc, err := tlsEndptCfg.ToService()
+			if err != nil {
+				return nil, err
+			}
+			apiVolumes = append(apiVolumes, svc.CreateVolume(endpt.String()))
+			httpdVolumeMount = append(httpdVolumeMount, svc.CreateVolumeMounts(endpt.String())...)
+		}
 	}
 
 	// Do not append apiType if we only have a single glanceAPI instance
@@ -209,7 +235,7 @@ func StatefulSet(
 								RunAsUser: &runAsUser,
 							},
 							Env:            env.MergeEnvs([]corev1.EnvVar{}, envVars),
-							VolumeMounts:   glance.GetHttpdVolumeMount(),
+							VolumeMounts:   httpdVolumeMount,
 							Resources:      instance.Spec.Resources,
 							StartupProbe:   startupProbe,
 							ReadinessProbe: readinessProbe,

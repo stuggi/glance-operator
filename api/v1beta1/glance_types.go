@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/storage"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -117,6 +118,12 @@ type GlanceSpec struct {
 	// Local storage request, in bytes. (500Gi = 500GiB = 500 * 1024 * 1024 * 1024)
 	// +kubebuilder:default=""
 	ImageCacheSize string `json:"imageCacheSize"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// TLS - Parameters related to the TLS
+	// TODO: (mschuppert) when tls DB connection got integrated
+	TLS tls.APIDB `json:"tls,omitempty"`
 }
 
 // PasswordSelector to identify the DB and AdminUser password from the Secret

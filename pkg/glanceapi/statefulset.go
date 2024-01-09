@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -164,20 +165,27 @@ func StatefulSet(
 		httpdVolumeMount = append(httpdVolumeMount, instance.Spec.TLS.CreateVolumeMounts(nil)...)
 	}
 
-	for endpt := range GetGlanceEndpoints(instance.Spec.APIType) {
+	for _, endpt := range []service.Endpoint{service.EndpointInternal, service.EndpointPublic} {
 		if instance.Spec.TLS.API.Enabled(endpt) {
-			var tlsEndptCfg tls.GenericService
+			var svc *tls.Service
+			var err error
 			switch endpt {
 			case service.EndpointPublic:
-				tlsEndptCfg = instance.Spec.TLS.API.Public
+				svc, err = instance.Spec.TLS.API.Public.ToService()
+				if err != nil {
+					return nil, err
+				}
+				svc.CertMount = ptr.To("/etc/pki/tls/certs/public.crt")
+				svc.KeyMount = ptr.To("/etc/pki/tls/private/public.key")
 			case service.EndpointInternal:
-				tlsEndptCfg = instance.Spec.TLS.API.Internal
+				svc, err = instance.Spec.TLS.API.Internal.ToService()
+				if err != nil {
+					return nil, err
+				}
+				svc.CertMount = ptr.To("/etc/pki/tls/certs/internal.crt")
+				svc.KeyMount = ptr.To("/etc/pki/tls/private/internal.key")
 			}
 
-			svc, err := tlsEndptCfg.ToService()
-			if err != nil {
-				return nil, err
-			}
 			apiVolumes = append(apiVolumes, svc.CreateVolume(endpt.String()))
 			httpdVolumeMount = append(httpdVolumeMount, svc.CreateVolumeMounts(endpt.String())...)
 		}

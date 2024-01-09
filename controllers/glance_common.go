@@ -43,7 +43,10 @@ const (
 )
 
 var (
-	allWatchFields = []string{
+	glanceWatchFields = []string{
+		passwordSecretField,
+	}
+	glanceAPIWatchFields = []string{
 		passwordSecretField,
 		caBundleSecretNameField,
 		tlsAPIInternalField,

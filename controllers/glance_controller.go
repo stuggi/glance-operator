@@ -231,7 +231,7 @@ func (r *GlanceReconciler) findObjectsForSrc(src client.Object) []reconcile.Requ
 
 	l := log.FromContext(context.Background()).WithName("Controllers").WithName("Glance")
 
-	for _, field := range allWatchFields {
+	for _, field := range glanceWatchFields {
 		crList := &glancev1.GlanceList{}
 		listOps := &client.ListOptions{
 			FieldSelector: fields.OneTermEqualSelector(field, src.GetName()),

@@ -317,7 +317,7 @@ func (r *GlanceAPIReconciler) findObjectsForSrc(src client.Object) []reconcile.R
 
 	l := log.FromContext(context.Background()).WithName("Controllers").WithName("GlanceAPI")
 
-	for _, field := range allWatchFields {
+	for _, field := range glanceAPIWatchFields {
 		crList := &glancev1.GlanceAPIList{}
 		listOps := &client.ListOptions{
 			FieldSelector: fields.OneTermEqualSelector(field, src.GetName()),
